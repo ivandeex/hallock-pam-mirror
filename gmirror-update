@@ -1,0 +1,238 @@
+#!/usr/bin/perl
+# vi: set ts=4 sw=4
+# Hallock
+# pam_gmirror module
+#
+# This script will setup local groups and login registry for group mirroring.
+#
+# $Id$
+# Copyright (C) 2008-2011, vitki.net
+#
+use strict;
+use Sys::Syslog qw( :DEFAULT setlogsock);
+
+my (%local, %master, %disable_for);
+
+my $grps = "/etc/group";
+my $conf = "/etc/security/gmirror.conf";
+my $sesf = "/var/run/gmirror-sessions";
+my $debug = 0;
+
+sub logit ($)
+{
+	my $msg = shift;
+	my $prio = 'info';
+	if ($msg =~ /^(info|err|debug):\s+(.*)$/) {
+		($prio, $msg) = ($1, $2);
+	}
+	if ($debug) {
+		print "$prio: $msg\n";
+	} elsif ($prio ne 'debug') {
+		setlogsock 'unix';
+		openlog 'gmirror', 'pid', 'authpriv';
+		syslog $prio, $msg;
+		closelog;
+	}
+}
+
+sub parse_groups ()
+{
+	unless (open (GRPS, $grps)) {
+		logit "err: cannot open $grps";
+		exit 1;
+	}
+
+	while (<GRPS>) {
+		chomp;
+		my ($group, $ignored, $gid, $members) = split /:/;
+		my @members = split /,/, $members;
+		$local{$group}{mine} = 0;
+		$local{$group}{gid} = $gid;
+		$local{$group}{members}{$_} = 1 for (@members);
+		$local{$group}{ops} = $#members < 0 ? '' : 'clean';
+		$members = join ',', map "\"$_\"", @members;
+		logit "debug: /etc/group \"$group\" == $gid : ($members)";
+	}
+
+	close GRPS;
+}
+
+sub parse_conf ($)
+{
+	my $pass = shift;
+	# pass 0:   parse all directives, only apply '==' directives,
+	#			only report syntax errors and errors in '==' directives,
+	#			report debugging information
+	# pass 1:   parse all directives, apply all but '==' directives
+	#			do not report syntax errors and debugging information,
+	#			report errors in all but '==' directives
+
+	unless (open(CONF, $conf)) {
+		logit "err: cannot open $conf";
+		exit 1;
+	}
+
+	my $cont = "";
+
+	while (<CONF>) {
+		chomp;
+		s/\#.*$//;
+		next if /^\s*$/;
+		if (/\\$/) {
+			s/\\$//;
+			$cont .= $_;
+			next;
+		}
+		$_ = $cont.$_;
+		$cont = "";
+		if (!/^\s*([\w]+)(?:\((\w+)\))?\s+(\+=|\-=|:=|::|==)([\w\s]+)?$/) {
+			logit "err: $conf: illegal syntax in line $.: $_" if $pass == 0;
+			next;
+		}
+		my ($group, $skin, $op, $members) = ($1, $2, $3, $4);
+		$skin = '' unless defined $skin;
+		$members =~ s/^\s+//;
+		$members =~ s/\s+$//;
+		my @members = split /\s+/, $members;
+		$members = join ',', map "\"$_\"", @members;
+
+		if ($group eq 'disable_for_skin' || $op eq '::' || $skin ne '') {
+			next if $pass == 0;
+			logit "debug: skin directive: \"$group\" $op ($members) skin=\"$skin\"\n";
+			if ($group ne 'disable_for_skin' || $op ne '::' || $skin eq '') {
+				logit "err: $conf: line $.: ".
+					  "error in disable_for_skin directive";
+				next;
+			}
+			for (@members) {
+				if (exists $local{$_}) {
+					$disable_for{$skin}{$_} = 1;
+				} else {
+					logit "err: $conf: line $.: local group \"$_\" not found";
+				}
+			}
+			next;
+		}
+
+		if ($op eq '+=' || $op eq '-=') {
+			next if $pass == 0;
+			my $subop = $op eq '+=' ? 'append' : 'remove';
+			logit "debug: $subop directive: \"$group\" $op ($members)\n";
+			logit "err: $conf: line $.: \"$group\" should not be local group"
+				if exists $local{$group};
+			for (@members) {
+				if (exists $local{$_}) {
+					logit "err: $conf: line $.: \"$_\" should not be local group";
+				} else {
+					$master{$group}{$subop}{$_} = 1;
+				}
+			}
+			next;
+		}
+
+		if ($op eq ':=') {
+			next if $pass == 0;
+			logit "debug: assign directive: \"$group\" $op ($members)\n";
+			logit "err: $conf: line $.: \"$group\" should not be local group"
+				if exists $local{$group};
+			for (@members) {
+				if (exists $local{$_}) {
+					$master{$group}{assoc}{$_} = 1;
+				} else {
+					logit "err: $conf: line $.: local group \"$_\" not found";
+				}
+			}
+			next;
+		}
+
+		if ($op eq '==') {
+			next if $pass == 1;
+			logit "debug: group id directive: \"$group\" $op ($members)\n";
+			if ($#members != 0 || $members[0] !~ /^\d+$/) {
+				logit "err: $conf: line $.: syntax error in group assignment";
+				next;
+			}
+			my $gid = $members[0];
+			if (exists $local{$group}) {
+				$local{$group}{mine} = 1;
+				my $oldgid = $local{$group}{gid};
+				if ($oldgid != $gid) {
+					$local{$group}{oldgid} = $oldgid;
+					$local{$group}{gid} = $gid;
+					$local{$group}{ops} = 'gid';
+				}
+			}
+			else {
+				$local{$group}{mine} = 1;
+				$local{$group}{gid} = $gid;
+				$local{$group}{members} = {};
+				$local{$group}{ops} = 'add';
+			}
+			next;
+		}
+	}
+
+	close CONF;
+}
+
+sub run ($) {
+	my $cmd = shift;
+	logit "debug: system: $cmd";
+	system $cmd unless $debug;
+}
+
+sub apply_groups ()
+{
+	for my $group (sort keys %local) {
+		next unless $local{$group}{mine};
+		my $ops = $local{$group}{ops};
+		if ($ops eq 'clean') {
+			logit "info: clean local group $group";
+			run "groupdel $group";
+			run "groupadd -g $local{$group}{gid} $group";
+		} elsif ($ops eq 'gid') {
+			my $oldgid = $local{$group}{oldgid};
+			my $gid = $local{$group}{gid};
+			logit "info: set local group \"$group\" gid from $oldgid to $gid";
+			run "groupdel $group";
+			run "groupadd -g $gid $group";
+		} elsif ($ops eq 'add') {
+			logit "info: create local group \"$group\"";
+			run "groupadd -g $local{$group}{gid} $group";		
+		}
+	}
+}
+
+sub purge_sessions ()
+{
+	if (open(SESF, $sesf)) {
+		while(<SESF>) {
+			if (/^\s*(\d+)\s+(\S+)\s*$/) {
+				my ($logn, $user) = ($1, $2);
+				if ($logn > 0) {
+					logit("info: purging stale session for $user");
+				}
+			}
+		}
+		close(SESF);
+		if (!open(SESF, "> $sesf")) {
+			logit("err: cannot purge sessions in $sesf");
+		}
+	} elsif (open(SESF, "> $sesf")) {
+		logit("info: created empty session file $sesf");
+	} else {
+		logit("err: cannot create session file $sesf");
+	}
+	close(SESF);
+}
+
+$debug = 1 if $ARGV[0] eq '-d' || $ARGV[0] eq '--debug';
+parse_groups();
+parse_conf(0);
+for (keys %local) { delete $local{$_} unless $local{$_}{mine} }
+logit "debug: got local group \"$_\" == $local{$_}{gid}" for (sort keys %local);
+parse_conf(1);
+apply_groups();
+purge_sessions();
+exit 0;
+
